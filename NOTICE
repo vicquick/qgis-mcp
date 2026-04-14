@@ -1,0 +1,21 @@
+QGIS MCP — aec-web fork
+========================
+
+This repository is a fork of https://github.com/jjsantos01/qgis_mcp (renamed
+from qgis_mcp to qgis-mcp for naming consistency across the aec-web MCP fleet).
+
+Upstream author: Juan José Santos (@jjsantos01)
+Upstream license: not specified — see upstream repo. Forking and redistribution
+follow GitHub Terms of Service community norms (the upstream has 143+ forks).
+If the upstream author specifies a license in the future, additions here will
+be relicensed to match.
+
+Additions in the `aec/` directory (plugin + server + Dockerfile) are authored
+by Victor (@vicquick) with AI assistance (Claude Sonnet 4.6 / Opus 4.6
+by Anthropic). These additions are released under the MIT License (see LICENSE.md).
+
+The original upstream files (qgis_mcp_plugin/, src/, main.py, pyproject.toml,
+uv.lock, etc.) are preserved unchanged under their original (unspecified) terms.
+
+Original QGIS MCP concept and socket-based plugin architecture: jjsantos01/qgis_mcp.
+Our modular 168-tool handler architecture and QGIS 4.0 / Qt6 port: novel additions.

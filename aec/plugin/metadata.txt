@@ -1,0 +1,16 @@
+[general]
+name=QGIS MCP
+description=Socket server for MCP (Model Context Protocol) AI integration
+version=3.0
+qgisMinimumVersion=4.0
+author=jjsantos01 (rewritten for QGIS 4.0 / Qt6)
+email=
+category=Plugins
+icon=
+tags=mcp,ai,automation,socket,claude
+homepage=https://github.com/jjsantos01/qgis_mcp
+tracker=https://github.com/jjsantos01/qgis_mcp/issues
+repository=https://github.com/jjsantos01/qgis_mcp
+
+[about]
+about=Modular MCP socket server for live QGIS control via AI assistants. Binds to port 9877, accepts newline-delimited JSON commands. Covers project management, layers, features, canvas, styling, labeling, layouts, database, processing, analysis, bookmarks, sketching, history, settings, and arbitrary PyQGIS code execution.
