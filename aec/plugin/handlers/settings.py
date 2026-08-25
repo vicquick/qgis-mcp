@@ -57,16 +57,30 @@ def register(server):
             config.setMode(m)
 
         if type is not None:
+            # Two different enums share the name SnappingType and they are not
+            # interchangeable. The class-local QgsSnappingConfig.SnappingType
+            # (Vertex/Segment/VertexAndSegment) belongs to setType(), which has
+            # been deprecated since 3.12; the modern global Qgis.SnappingType
+            # belongs to setTypeFlag(). This mapped modern members onto the
+            # deprecated setter, so on QGIS 4 every call raised — TypeError for
+            # the valid names, AttributeError for VertexAndSegment, which does
+            # not exist on the modern enum at all.
             type_map = {
                 "vertex": Qgis.SnappingType.Vertex,
                 "segment": Qgis.SnappingType.Segment,
-                "vertex_and_segment": Qgis.SnappingType.VertexAndSegment,
+                "vertex_and_segment": Qgis.SnappingType.Vertex | Qgis.SnappingType.Segment,
                 "area": Qgis.SnappingType.Area,
+                # Available on the modern enum and previously unreachable.
+                "centroid": Qgis.SnappingType.Centroid,
+                "line_endpoint": Qgis.SnappingType.LineEndpoint,
+                "middle_of_segment": Qgis.SnappingType.MiddleOfSegment,
             }
             t = type_map.get(type.lower())
             if t is None:
-                raise RuntimeError(f"Unknown snapping type: {type}")
-            config.setType(t)
+                raise RuntimeError(
+                    f"Unknown snapping type: {type}. "
+                    f"Expected one of: {', '.join(sorted(type_map))}")
+            config.setTypeFlag(t)
 
         if tolerance is not None:
             config.setTolerance(tolerance)
