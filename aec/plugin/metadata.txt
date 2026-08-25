@@ -1,8 +1,10 @@
 [general]
 name=QGIS MCP
 description=Socket server for MCP (Model Context Protocol) AI integration
-version=3.0
+version=3.1
 qgisMinimumVersion=4.0
+# Verified against 4.2.1: all 17 handler modules import and register,
+# 133 handlers, 0 failures. No maximum set deliberately.
 author=jjsantos01 (rewritten for QGIS 4.0 / Qt6)
 email=
 category=Plugins

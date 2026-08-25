@@ -2,7 +2,7 @@
 QGIS MCP Server — Non-blocking socket server with newline-delimited JSON framing.
 
 Accepts commands from the MCP proxy and dispatches to registered handler functions.
-QGIS 4.0 / Qt6 / Python 3.13
+QGIS 4.x / Qt6 — verified on 4.2.1
 """
 
 import json
