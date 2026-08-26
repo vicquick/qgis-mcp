@@ -87,11 +87,39 @@ class QgisMCPServer(QObject):
         if not self.running:
             return
         try:
-            # Accept new connections
-            if not self._client and self._socket:
+            # Accept new connections.
+            #
+            # Always attempt the accept, even while a client is held. This used
+            # to accept only when self._client was None, so a client that died
+            # abruptly — an MCP server killed rather than shut down — left a
+            # half-open socket in that slot forever. Nothing arrives on a dead
+            # peer for recv() to fail on, so the slot was never released and
+            # every later connection was refused: the bridge stayed wedged
+            # until the plugin was stopped and started by hand.
+            #
+            # A newer connection therefore takes over from an older one. Only
+            # one MCP server talks to this plugin at a time, so the newcomer is
+            # by definition the live one.
+            if self._socket:
                 try:
-                    self._client, addr = self._socket.accept()
-                    self._client.setblocking(False)
+                    new_client, addr = self._socket.accept()
+                    new_client.setblocking(False)
+                    # Let the OS notice a peer that vanishes without a FIN.
+                    try:
+                        new_client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    except Exception:
+                        pass
+                    if self._client:
+                        QgsMessageLog.logMessage(
+                            "Replacing a previous client connection",
+                            "QGIS MCP", Qgis.MessageLevel.Info,
+                        )
+                        try:
+                            self._client.close()
+                        except Exception:
+                            pass
+                        self._buffer = b""
+                    self._client = new_client
                     QgsMessageLog.logMessage(
                         f"Client connected: {addr}", "QGIS MCP", Qgis.MessageLevel.Info,
                     )

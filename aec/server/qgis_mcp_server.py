@@ -9,18 +9,28 @@ import logging
 from contextlib import asynccontextmanager
 import socket
 import json
-from typing import AsyncIterator, Dict, Any
+from typing import AsyncIterator, Dict, Any, Optional
 import io
 import sys
-from mcp.server.fastmcp import FastMCP, Context
-from mcp.server.fastmcp.utilities.types import Image
+import asyncio
+# Migrated bundled mcp.server.fastmcp -> standalone fastmcp 3.x: the bundled
+# build has no tags, no per-tool timeout and no middleware, so toolset presets,
+# call timeouts, response caching and the progress heartbeat were all
+# unreachable.
+from fastmcp import FastMCP, Context
+from fastmcp.utilities.types import Image
+from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations, TextContent
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("QgisMCPServer")
 
-QGIS_HOST = os.environ.get("DESKTOP_HOST", "aec-web")
+# Default to loopback. This used to default to "aec-web", a Docker
+# service hostname from the original containerised deployment, so any
+# run without DESKTOP_HOST set failed with a getaddrinfo error that
+# named a host the user has never heard of.
+QGIS_HOST = os.environ.get("DESKTOP_HOST", "127.0.0.1")
 QGIS_PORT = int(os.environ.get("QGIS_MCP_PORT", "9877"))
 
 
@@ -37,6 +47,19 @@ QGIS_SOCKET_TIMEOUT = float(os.environ.get("QGIS_SOCKET_TIMEOUT", "180"))
 # apart raced the server's FIN on the idle connection — the sporadic "Unable to
 # connect" that succeeds instantly on retry.
 QGIS_KEEPALIVE = int(os.environ.get("QGIS_KEEPALIVE", "600"))
+
+# Per-call timeout applied to every tool. The old ceiling was the socket
+# timeout alone, which capped calls below the two-minute mark at which a client
+# moves a long call to a background task — so a long Processing run could only
+# ever come back as a timeout. The heartbeat below keeps the client's idle
+# abort off the call while it runs.
+QGIS_CALL_TIMEOUT = float(os.environ.get("QGIS_CALL_TIMEOUT", "900"))
+# Progress heartbeat interval. A client aborts a call that sends neither a
+# response nor a progress notification for its idle window (five minutes for an
+# HTTP server). 0 disables.
+QGIS_HEARTBEAT = float(os.environ.get("QGIS_HEARTBEAT", "20"))
+# Read-only response cache TTL, applied ONLY to the allowlist below.
+QGIS_CACHE_TTL = int(os.environ.get("QGIS_CACHE_TTL", "30"))
 
 
 class QgisMCPServer:
@@ -186,13 +209,13 @@ mcp = FastMCP(
         'NEVER call QgsProject.write() from execute_code - it has crashed QGIS; ask '
         'the user to save with Ctrl+S instead.'
     ),
-    host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
-    port=int(os.environ.get("FASTMCP_PORT", "8081")),
     lifespan=server_lifespan
 )
 
 
 
+
+from qgis_tool_tags import TOOL_TAGS, PRESETS, preset_tags
 
 # ── Tool classification ────────────────────────────────────────────
 # Derived from the tool name at registration, so adding a tool stays a
@@ -225,16 +248,21 @@ _MAX_RESULT_CHARS = {
 
 
 def qtool(fn=None, **kwargs):
-    """@qtool plus the annotations a client can actually use.
+    """mcp.tool() plus the annotations, tag and timeout a client can use.
 
-    structured_output=False is the load-bearing part: without it every tool
-    emits an outputSchema derived from its `-> str` return, which is dead
-    weight in tools/list and has historically caused clients to drop the whole
-    server's tool set.
+    output_schema=None is the load-bearing part: without it every tool emits an
+    outputSchema derived from its `-> str` return, which is dead weight in
+    tools/list and has historically caused clients to drop the whole server's
+    tool set. On standalone fastmcp the kwarg is output_schema, not the bundled
+    build's structured_output — passing the old name silently does nothing.
     """
     def deco(f):
         name = f.__name__
-        kwargs.setdefault("structured_output", False)
+        kwargs.setdefault("output_schema", None)
+        kwargs.setdefault("timeout", QGIS_CALL_TIMEOUT)
+        tag = TOOL_TAGS.get(name)
+        if tag:
+            kwargs["tags"] = set(kwargs.get("tags") or set()) | {tag}
         readonly = name in _RO_NAMES or name.startswith(_RO_PREFIXES)
         destructive = name.startswith(_DESTRUCTIVE_PREFIXES)
         kwargs.setdefault("annotations", ToolAnnotations(
@@ -641,10 +669,14 @@ def remove_layout_item(ctx: Context, layout_name: str, item_id: str) -> str:
     return cmd("remove_layout_item", {"layout_name": layout_name, "item_id": item_id})
 
 @qtool
-def set_layout_item_property(ctx: Context, layout_name: str, item_id: str, **kwargs) -> str:
-    """Set properties on a layout item (x, y, width, height, text, font_size, etc.)"""
+def set_layout_item_property(ctx: Context, layout_name: str, item_id: str,
+                             properties: Optional[Dict[str, Any]] = None) -> str:
+    """Set properties on a layout item.
+
+    properties keys: x, y, width, height, text, font_size, frame, background,
+    reference_point, rotation. Example: {"x": 10, "y": 20, "text": "Title"}."""
     p = {"layout_name": layout_name, "item_id": item_id}
-    p.update(kwargs)
+    p.update(properties or {})
     return cmd("set_layout_item_property", p)
 
 @qtool
@@ -805,10 +837,14 @@ def clear_annotations(ctx: Context) -> str:
     return cmd("clear_annotations")
 
 @qtool
-def add_map_decoration(ctx: Context, decoration: str, **kwargs) -> str:
-    """Add decoration: grid, north_arrow, scale_bar"""
+def add_map_decoration(ctx: Context, decoration: str,
+                       properties: Optional[Dict[str, Any]] = None) -> str:
+    """Add a map decoration. decoration: grid | north_arrow | scale_bar.
+
+    properties are decoration-specific, e.g. {"placement": "top_right"} for
+    north_arrow, or {"interval": 1000, "style": "line"} for grid."""
     p = {"decoration": decoration}
-    p.update(kwargs)
+    p.update(properties or {})
     return cmd("add_map_decoration", p)
 
 
@@ -948,11 +984,15 @@ def get_raster_info(ctx: Context, layer_id: str) -> str:
     return cmd("get_raster_info", {"layer_id": layer_id})
 
 @qtool
-def set_raster_renderer(ctx: Context, layer_id: str, renderer_type: str, **kwargs) -> str:
-    """Set raster renderer. renderer_type: singleband_gray, singleband_pseudocolor, multiband, hillshade.
-    pseudocolor: color_ramp, min, max. multiband: red_band, green_band, blue_band. hillshade: altitude, azimuth, z_factor"""
+def set_raster_renderer(ctx: Context, layer_id: str, renderer_type: str,
+                        properties: Optional[Dict[str, Any]] = None) -> str:
+    """Set the raster renderer.
+
+    renderer_type: singleband_gray | singleband_pseudocolor | multiband | hillshade.
+    properties by type — pseudocolor: color_ramp, min, max; multiband:
+    red_band, green_band, blue_band; hillshade: altitude, azimuth, z_factor."""
     p = {"layer_id": layer_id, "renderer_type": renderer_type}
-    p.update(kwargs)
+    p.update(properties or {})
     return cmd("set_raster_renderer", p)
 
 @qtool
@@ -1644,27 +1684,131 @@ def screenshot(ctx: Context, max_width: int = 1400):
     img = Image(data=png, format="png")
     if not note:
         return img
-    return [TextContent(type="text", text=note), img.to_image_content()]
+    return ToolResult(content=[TextContent(type="text", text=note),
+                               img.to_image_content()])
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Middleware
+# ═══════════════════════════════════════════════════════════════════
+
+from fastmcp.server.middleware import Middleware
+
+
+class ProgressHeartbeatMiddleware(Middleware):
+    """Emit a progress notification while a tool call is still outstanding.
+
+    A Processing algorithm over a large layer legitimately runs for minutes.
+    Without a heartbeat the client aborts it as idle, and a call the client has
+    backgrounded is indistinguishable from a hung one.
+
+    The tool bodies are synchronous — they block in the threadpool on the
+    socket — so they cannot await anything themselves. Doing this in async
+    middleware leaves all 170 of them unchanged.
+    """
+
+    def __init__(self, interval: float = 20.0):
+        self.interval = interval
+
+    async def on_call_tool(self, context, call_next):
+        ctx = getattr(context, "fastmcp_context", None)
+        if ctx is None or self.interval <= 0:
+            return await call_next(context)
+        task = asyncio.ensure_future(call_next(context))
+        waited = 0.0
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=self.interval)
+            if done:
+                break
+            waited += self.interval
+            try:
+                # No total: QGIS does not report percent-complete through this
+                # transport, and a made-up denominator renders as a lying bar.
+                await ctx.report_progress(progress=waited)
+            except Exception:
+                pass
+        return await task
+
+
+# Read-only tools whose answers are stable for a short window. Strictly an
+# allowlist: the cache is keyed on name + arguments and knows nothing about
+# project mutation, so anything a map edit can invalidate stays out. Layer and
+# feature reads are absent for exactly that reason, despite being read-only.
+_CACHEABLE = [
+    "ping",
+    "get_qgis_info",
+    "list_processing_algorithms",
+    "get_processing_algorithm_help",
+    "list_plugins",
+]
+
+
+def _install_middleware():
+    from fastmcp.server.middleware.timing import TimingMiddleware
+    mcp.add_middleware(TimingMiddleware())
+    if QGIS_HEARTBEAT > 0:
+        mcp.add_middleware(ProgressHeartbeatMiddleware(QGIS_HEARTBEAT))
+        logger.info(f"progress heartbeat every {QGIS_HEARTBEAT:.0f}s")
+    if QGIS_CACHE_TTL > 0:
+        try:
+            from fastmcp.server.middleware.caching import ResponseCachingMiddleware
+            mcp.add_middleware(ResponseCachingMiddleware(
+                call_tool_settings={"enabled": True, "ttl": QGIS_CACHE_TTL,
+                                    "included_tools": _CACHEABLE},
+                # tools/list is deliberately NOT cached: set_toolset changes the
+                # visible surface, and a cached catalogue would keep serving the
+                # pre-switch tool set until the TTL expired.
+                list_tools_settings={"enabled": False},
+                list_resources_settings={"enabled": False},
+                list_prompts_settings={"enabled": False},
+                read_resource_settings={"enabled": False},
+                get_prompt_settings={"enabled": False},
+            ))
+            logger.info(f"response cache on for {len(_CACHEABLE)} read-only tools "
+                        f"(ttl {QGIS_CACHE_TTL}s)")
+        except Exception as e:
+            logger.warning(f"response caching unavailable: {e}")
+
+
+@qtool
+def set_toolset(ctx: Context, preset: str) -> str:
+    """Reshape the visible toolset in place: full | cartography | data | geoprocess | minimal.
+
+    Switching emits tools/list_changed, so the client picks up the new surface
+    without reconnecting. 'full' restores everything."""
+    if preset not in PRESETS:
+        return json.dumps({"error": f"unknown preset '{preset}'",
+                           "available": sorted(PRESETS)}, ensure_ascii=False)
+    # 'full' means every tag, not "no argument": a bare mcp.enable() does not
+    # clear a previously applied only=True filter.
+    tags = preset_tags(preset) or set(TOOL_TAGS.values())
+    mcp.enable(tags=tags, only=True)
+    count = len([n for n, t in TOOL_TAGS.items() if t in tags])
+    return json.dumps({"status": "ok", "preset": preset, "tools": count,
+                       "tags": sorted(tags)}, ensure_ascii=False)
 
 def main():
+    _install_middleware()
+    # QGIS_TOOLSET=cartography|data|geoprocess|minimal|full (default full).
+    sel = os.environ.get("QGIS_TOOLSET", "full")
+    tags = preset_tags(sel)
+    if tags:
+        mcp.enable(tags=tags, only=True)
+        logger.info(f"QGIS_TOOLSET={sel}: limited to tags {sorted(tags)}")
+
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport in ("http", "streamable-http", "sse"):
-        # The bundled FastMCP does not expose uvicorn's config, and its default
-        # 5s idle keep-alive drops connections between spaced-out tool calls.
-        # Widen the default at the source before the server is built.
-        try:
-            import uvicorn
-            _orig = uvicorn.Config.__init__
-
-            def _patched(self, *a, **kw):
-                kw.setdefault("timeout_keep_alive", QGIS_KEEPALIVE)
-                return _orig(self, *a, **kw)
-
-            uvicorn.Config.__init__ = _patched
-            logger.info(f"uvicorn keep-alive set to {QGIS_KEEPALIVE}s")
-        except Exception as e:
-            logger.warning(f"could not widen uvicorn keep-alive: {e}")
-    mcp.run(transport=transport)
+        mcp.run(
+            transport=transport,
+            host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
+            port=int(os.environ.get("FASTMCP_PORT", "8081")),
+            # uvicorn's default idle keep-alive is 5s, so two tool calls spaced
+            # further apart raced the server's FIN on the idle connection —
+            # the sporadic "Unable to connect" that succeeds on retry.
+            uvicorn_config={"timeout_keep_alive": QGIS_KEEPALIVE},
+        )
+    else:
+        mcp.run(transport=transport)
 
 if __name__ == "__main__":
     main()
