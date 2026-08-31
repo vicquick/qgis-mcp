@@ -1,1 +1,3 @@
-from .qgis_mcp_plugin import classFactory
+from .plugin import classFactory
+
+__all__ = ["classFactory"]
