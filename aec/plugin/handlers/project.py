@@ -18,8 +18,19 @@ def register(server):
     s = server
 
     def ping(**_):
-        """Basic connectivity check. Returns pong if server is alive."""
-        return {"pong": True}
+        """Basic connectivity check. Returns pong if server is alive, plus
+        identity for telling QGIS instances apart when several run at once:
+        pid, the bound port, and the open project's path/title."""
+        project = QgsProject.instance()
+        path = project.fileName()
+        title = project.title() or (os.path.basename(path) if path else "")
+        return {
+            "pong": True,
+            "pid": os.getpid(),
+            "port": getattr(s, "port", None),
+            "project_path": path,
+            "project_title": title,
+        }
 
     def get_qgis_info(**_):
         """Return QGIS version, Qt version, profile path, and plugin count."""

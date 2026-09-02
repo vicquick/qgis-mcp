@@ -7,6 +7,7 @@ Connects to the QGIS MCP plugin running inside the desktop container.
 import os
 import logging
 from contextlib import asynccontextmanager
+import select
 import socket
 import json
 from typing import AsyncIterator, Dict, Any, Optional
@@ -31,7 +32,12 @@ logger = logging.getLogger("QgisMCPServer")
 # run without DESKTOP_HOST set failed with a getaddrinfo error that
 # named a host the user has never heard of.
 QGIS_HOST = os.environ.get("DESKTOP_HOST", "127.0.0.1")
+# QGIS_MCP_PORT is the START of the scan range, not a fixed port: the plugin's
+# own bind loop tries QGIS_MCP_PORT..+QGIS_MCP_PORT_SPAN-1 and keeps the first
+# free one, so multiple QGIS instances land on different ports in this range.
+# The bridge scans the same range (list_qgis_instances) to find them all.
 QGIS_PORT = int(os.environ.get("QGIS_MCP_PORT", "9877"))
+QGIS_PORT_SPAN = int(os.environ.get("QGIS_MCP_PORT_SPAN", "10"))
 
 
 import threading
@@ -101,6 +107,24 @@ class QgisMCPServer:
         t0 = time.perf_counter()
         try:
             with self._lock:
+                # Probe for a dead or desynced stream BEFORE sending. When QGIS
+                # restarts, its FIN leaves this socket readable with recv()
+                # returning b"" — yet sendall() still "succeeds" into the local
+                # buffer, so the failure used to surface only as an "Empty
+                # response" AND the poisoned socket was kept for the next call.
+                # A call that timed out earlier can likewise leave stale reply
+                # bytes queued. Both are detected here, where dropping the
+                # socket is provably safe because nothing has been sent yet.
+                if self.socket is not None:
+                    try:
+                        readable, _, _ = select.select([self.socket], [], [], 0)
+                        if readable:
+                            if not self.socket.recv(65536):
+                                raise ConnectionError("peer closed (QGIS restarted?)")
+                            raise ConnectionError("stale bytes on stream")
+                    except Exception as pe:
+                        logger.warning(f"tool={command_type} cid={cid} dropping dead socket ({pe})")
+                        self.disconnect()
                 # A stale socket (plugin restarted, idle RST) fails on SEND,
                 # before QGIS has seen anything, so one reconnect and resend is
                 # safe here. Never retry after a send succeeds: the command may
@@ -127,8 +151,15 @@ class QgisMCPServer:
                         result = json.loads(response_data.split(b"\n", 1)[0].decode("utf-8"))
                         break
                 if result is None:
-                    result = (json.loads(response_data.strip().decode("utf-8"))
-                              if response_data.strip() else {"error": "Empty response"})
+                    if response_data.strip():
+                        result = json.loads(response_data.strip().decode("utf-8"))
+                    else:
+                        # Peer closed without a reply: the connection is unusable
+                        # and MUST be dropped, or every later call inherits it.
+                        self.disconnect()
+                        result = {"error": "QGIS closed the connection without a reply "
+                                           "(plugin stopped or QGIS restarted?) — retry the call.",
+                                  "cid": cid, "code": "QGIS_GONE"}
             ms = (time.perf_counter() - t0) * 1000
             status = "err" if isinstance(result, dict) and result.get("status") == "error" else "ok"
             logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} status={status}")
@@ -145,23 +176,119 @@ class QgisMCPServer:
             return {"error": str(e), "cid": cid}
 
 
-_qgis_connection = None
+# Multi-instance: one QgisMCPServer per port, kept for the process lifetime
+# (each keeps its own lock and reconnect state — the pool never discards an
+# object just because its socket dropped), plus which port is "active" right
+# now. Every plain tool call goes through the active one via
+# get_qgis_connection(); list_qgis_instances/select_qgis_instance are the only
+# things that look past it.
+_qgis_pool: Dict[int, "QgisMCPServer"] = {}
+_active_port: Optional[int] = None
+_pool_lock = threading.Lock()
+
+
+def _pooled(port: int) -> "QgisMCPServer":
+    """Get-or-create the persistent connection object for one port."""
+    with _pool_lock:
+        conn = _qgis_pool.get(port)
+        if conn is None:
+            conn = QgisMCPServer(port=port)
+            _qgis_pool[port] = conn
+        return conn
+
+
+def _scan_instances(timeout: float = 0.5):
+    """Probe QGIS_HOST:[QGIS_PORT..QGIS_PORT+QGIS_PORT_SPAN) for live plugins.
+
+    Uses THROWAWAY sockets, never the pooled connections — the plugin serves
+    one client at a time, so scanning through a pooled socket would itself
+    steal that instance's client slot out from under whatever else is using
+    it. A scan can still collide with a pooled connection that happens to be
+    mid-request on the SAME port; acceptable for an opt-in discovery call.
+
+    Because every responding plugin's single client slot was briefly taken by
+    our scan socket (then immediately closed), every pooled connection is
+    marked stale afterwards — they reconnect lazily on next use, the same
+    path that already handles a plugin restart mid-session.
+    """
+    found = []
+    for port in range(QGIS_PORT, QGIS_PORT + QGIS_PORT_SPAN):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        resp = None
+        try:
+            s.connect((QGIS_HOST, port))
+            payload = json.dumps({"type": "ping", "params": {},
+                                  "_cid": uuid.uuid4().hex[:8]}).encode("utf-8") + b"\n"
+            s.sendall(payload)
+            data = b""
+            while b"\n" not in data:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            if data.strip():
+                resp = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+        except Exception:
+            pass
+        finally:
+            try: s.close()
+            except Exception: pass
+        if resp is None:
+            continue
+        # Old plugins reply {"pong": true} with no pid/port/project_* keys —
+        # report those as null rather than dropping the instance.
+        info = resp.get("result") if isinstance(resp.get("result"), dict) else resp
+        found.append({
+            "port": port,
+            "pid": info.get("pid"),
+            "project_title": info.get("project_title"),
+            "project_path": info.get("project_path"),
+            "active": port == _active_port,
+        })
+    with _pool_lock:
+        for conn in _qgis_pool.values():
+            # conn._lock (not just _pool_lock) is required here: it's what
+            # send_command() holds for its entire sendall/recv duration to
+            # guard exactly this socket against concurrent access. Without
+            # it, disconnecting here can close a connection's live socket
+            # out from under a thread that's mid-recv() on an in-flight
+            # tool call on another instance, turning a normal long-running
+            # call into a spurious failure.
+            with conn._lock:
+                conn.disconnect()
+    return found
+
 
 def get_qgis_connection():
-    global _qgis_connection
+    """Return the pooled connection for the active QGIS instance.
+
+    On first use, with no instance explicitly chosen via
+    select_qgis_instance, this scans the port range and auto-selects the
+    lowest responding port — exactly today's single-instance behavior when
+    only one QGIS is running. Once an active port is set (auto or explicit)
+    it sticks; a dead socket on it reconnects in place rather than
+    re-scanning or silently switching instances.
+    """
+    global _active_port
+    if _active_port is None:
+        found = _scan_instances()
+        if not found:
+            raise Exception(
+                f"Could not connect to QGIS on {QGIS_HOST}:{QGIS_PORT}-"
+                f"{QGIS_PORT + QGIS_PORT_SPAN - 1}. Start the plugin first.")
+        _active_port = min(i["port"] for i in found)
+        logger.info(f"Auto-selected QGIS instance on port {_active_port}")
+
+    conn = _pooled(_active_port)
     # NOTE: no sendall(b'') "probe" here. Sending zero bytes never fails, even
     # on a dead socket, so it detected nothing and the first call after an idle
     # period failed while the retry succeeded. send_command reconnects itself.
-    if _qgis_connection is not None and _qgis_connection.socket is not None:
-        return _qgis_connection
-    if _qgis_connection is not None and _qgis_connection.connect():
-        return _qgis_connection
-    _qgis_connection = QgisMCPServer()
-    if not _qgis_connection.connect():
-        _qgis_connection = None
-        raise Exception(f"Could not connect to QGIS at {QGIS_HOST}:{QGIS_PORT}. Start the plugin first.")
-    logger.info(f"Connected to QGIS at {QGIS_HOST}:{QGIS_PORT}")
-    return _qgis_connection
+    if conn.socket is not None:
+        return conn
+    if conn.connect():
+        return conn
+    raise Exception(f"Could not connect to QGIS at {QGIS_HOST}:{_active_port}. Start the plugin first.")
 
 
 def cmd(command_type, params=None):
@@ -184,10 +311,16 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"Could not connect on startup: {e}")
     yield {}
-    global _qgis_connection
-    if _qgis_connection:
-        _qgis_connection.disconnect()
-        _qgis_connection = None
+    global _active_port
+    with _pool_lock:
+        for conn in _qgis_pool.values():
+            # Same conn._lock requirement as _scan_instances' cleanup above:
+            # a tool call can still be in flight on a pooled connection at
+            # process shutdown.
+            with conn._lock:
+                conn.disconnect()
+        _qgis_pool.clear()
+    _active_port = None
 
 
 mcp = FastMCP(
@@ -207,7 +340,9 @@ mcp = FastMCP(
         "Results are JSON: {status:'success', result:...} or {status:'error', "
         'message:...}. Layers are addressed by layer id, not by name. '
         'NEVER call QgsProject.write() from execute_code - it has crashed QGIS; ask '
-        'the user to save with Ctrl+S instead.'
+        'the user to save with Ctrl+S instead. '
+        'Multiple QGIS windows may be running: list_qgis_instances discovers them '
+        'and select_qgis_instance picks which one every other tool talks to.'
     ),
     lifespan=server_lifespan
 )
@@ -326,6 +461,60 @@ def get_project_variables(ctx: Context) -> str:
 def set_project_variable(ctx: Context, name: str, value: str) -> str:
     """Set a project variable"""
     return cmd("set_project_variable", {"name": name, "value": value})
+
+
+# ── Multi-instance ─────────────────────────────────────────────────
+# Deliberately absent from _CACHEABLE below: instance discovery must always
+# hit the network live, and select changes which instance every other tool
+# reaches, so a cached answer for either would be actively misleading.
+
+@qtool
+def list_qgis_instances(ctx: Context) -> str:
+    """Discover QGIS instances listening on {host}:{QGIS_MCP_PORT}..+QGIS_MCP_PORT_SPAN-1.
+
+    Scans with disposable sockets, so it never disturbs a tool call in
+    flight on another instance. Each responding instance reports port, pid,
+    project_title, project_path, and whether it is the currently active one
+    (an older plugin without these ping fields reports port with the rest
+    null). Use select_qgis_instance to change which one subsequent tool
+    calls reach."""
+    found = _scan_instances()
+    return json.dumps({"status": "ok", "host": QGIS_HOST, "active_port": _active_port,
+                       "instances": found}, ensure_ascii=False)
+
+@qtool
+def select_qgis_instance(ctx: Context, port: int = None, project: str = None) -> str:
+    """Choose which QGIS instance every other tool call reaches from now on.
+
+    Pass exactly one of: port (exact match), or project (case-insensitive
+    substring of the instance's project_title or project_path). Scans fresh
+    before matching, so the selection reflects instances live right now.
+    Errors with the full discovered list if nothing matches or more than one
+    project match is ambiguous."""
+    global _active_port
+    if port is None and not project:
+        return json.dumps({"error": "pass port or project"}, ensure_ascii=False)
+    found = _scan_instances()
+    if port is not None:
+        matches = [i for i in found if i["port"] == port]
+        if not matches:
+            return json.dumps({"error": f"no QGIS instance responding on port {port}",
+                               "instances": found}, ensure_ascii=False)
+    else:
+        needle = project.lower()
+        matches = [i for i in found
+                   if needle in (i.get("project_title") or "").lower()
+                   or needle in (i.get("project_path") or "").lower()]
+        if not matches:
+            return json.dumps({"error": f"no QGIS instance matches project {project!r}",
+                               "instances": found}, ensure_ascii=False)
+        if len(matches) > 1:
+            return json.dumps({"error": f"{len(matches)} QGIS instances match project "
+                               f"{project!r} — be more specific, or select by port",
+                               "instances": matches}, ensure_ascii=False)
+    _active_port = matches[0]["port"]
+    selected = {**matches[0], "active": True}
+    return json.dumps({"status": "ok", "selected": selected}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1735,7 +1924,9 @@ class ProgressHeartbeatMiddleware(Middleware):
 # project mutation, so anything a map edit can invalidate stays out. Layer and
 # feature reads are absent for exactly that reason, despite being read-only.
 _CACHEABLE = [
-    "ping",
+    # "ping" is deliberately NOT cached: it is the liveness probe, and the
+    # cache also stores error results — a cached failure made a recovered
+    # connection look dead for a full TTL.
     "get_qgis_info",
     "list_processing_algorithms",
     "get_processing_algorithm_help",

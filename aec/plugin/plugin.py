@@ -3,11 +3,17 @@ QGIS MCP Plugin entry point — menu, toolbar, auto-start, dock widget.
 QGIS 4.0 / Qt6
 """
 
+import datetime
+import os
+
+from qgis.core import QgsApplication
 from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QAction
 
 from .ui import QgisMCPDockWidget
+
+_LOG_PATH = os.path.join(os.path.dirname(__file__), "mcp_debug.log")
 
 
 class QgisMCPPlugin:
@@ -17,9 +23,46 @@ class QgisMCPPlugin:
         self.iface = iface
         self.dock: QgisMCPDockWidget | None = None
         self.action: QAction | None = None
+        self._log_handler = None
+
+    def _setup_file_logging(self):
+        """Tee all QGIS MCP log messages to mcp_debug.log (survives QGIS crashes).
+
+        Best-effort only: initGui() calls this first, before the toolbar
+        action/menu entry exist and before auto-start is scheduled, so an
+        unwritable plugin directory (system-wide install, locked-down
+        profile, full disk) must not raise out of here — that would fail
+        the whole plugin load (menu, toolbar icon, MCP auto-start included)
+        over what is meant to be optional debug logging.
+        """
+        try:
+            with open(_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(
+                    f"\n{'='*60}\n"
+                    f"Session started {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"{'='*60}\n"
+                )
+        except Exception:
+            pass
+
+        def on_message(message, tag, level):
+            if "MCP" in tag or "mcp" in tag.lower():
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                level_names = {0: "INFO", 1: "WARN", 2: "CRIT", 3: "SUCC"}
+                lvl = level_names.get(int(level), str(level))
+                try:
+                    with open(_LOG_PATH, "a", encoding="utf-8") as f:
+                        f.write(f"[{ts}] [{lvl}] {message}\n")
+                except Exception:
+                    pass
+
+        QgsApplication.messageLog().messageReceived.connect(on_message)
+        self._log_handler = on_message  # keep reference — prevents GC disconnect
 
     def initGui(self):
         """Called by QGIS when the plugin is loaded."""
+        self._setup_file_logging()
+
         self.action = QAction("QGIS MCP", self.iface.mainWindow())
         self.action.setCheckable(True)
         self.action.triggered.connect(self._toggle)

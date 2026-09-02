@@ -5,7 +5,9 @@ Accepts commands from the MCP proxy and dispatches to registered handler functio
 QGIS 4.x / Qt6 — verified on 4.2.1
 """
 
+import errno
 import json
+import os
 import socket
 import traceback
 
@@ -23,13 +25,43 @@ GEOMETRY_TYPE_NAMES = {
 }
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to `default` if unset or not an int."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# A single fixed port means only one QGIS instance can ever be controlled at
+# a time. QGIS_MCP_PORT/QGIS_MCP_PORT_SPAN mirror the bridge's own env vars
+# (see aec/server/qgis_mcp_server.py) so a value set for one side holds for
+# the other: this is the *start* of a range, not a fixed port — start()
+# below binds the first free port in [port, port + port_span).
+DEFAULT_PORT_START = _env_int("QGIS_MCP_PORT", 9877)
+DEFAULT_PORT_SPAN = _env_int("QGIS_MCP_PORT_SPAN", 10)
+
+
 class QgisMCPServer(QObject):
     """Socket server that accepts MCP commands and dispatches to registered handlers."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 9877, iface: QgisInterface = None):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = None,
+        port_span: int = None,
+        iface: QgisInterface = None,
+    ):
         super().__init__()
         self.host = host
-        self.port = port
+        # `port` starts out as the requested/first-tried port; start() below
+        # rewrites it to whichever port in the range actually got bound, so
+        # callers must read it back (self.server.port) only after start().
+        self.port = DEFAULT_PORT_START if port is None else port
+        self.port_span = max(1, DEFAULT_PORT_SPAN if port_span is None else port_span)
         self.iface = iface
         self.running = False
         self._socket: socket.socket | None = None
@@ -39,16 +71,81 @@ class QgisMCPServer(QObject):
         self._HANDLERS: dict = {}
 
     def start(self) -> bool:
-        """Start listening for connections."""
+        """Start listening for connections.
+
+        Tries every port in [self.port, self.port + self.port_span) in turn
+        and binds the first free one, so a second (third, ...) QGIS instance
+        on the same machine lands on the next port instead of failing to
+        start. self.port is updated to whatever actually got bound.
+        """
         # Register all handlers before starting
         from .handlers import register_all_handlers
         register_all_handlers(self)
 
         self.running = True
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        port_start = self.port
+        # Clamp to the valid TCP port range. self.port_span defaults to 10, but
+        # ui.py's spin box allows a start port up to 65535, and a start port
+        # above 65526 would otherwise put candidates past 65535 into bind()'s
+        # (host, port) tuple — raising OverflowError, which is NOT an OSError
+        # and is not caught below, so it would propagate out of start()
+        # uncaught instead of hitting the graceful "failed to bind" path.
+        port_end = min(port_start + self.port_span, 65536)
+        bound_socket = None
+        last_error: Exception | None = None
+        for candidate in range(port_start, port_end):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Deliberately NOT setting SO_REUSEADDR before this bind-probe.
+            # On Windows, SO_REUSEADDR lets bind() succeed even when another
+            # process already has this port bound and LISTENing — it does
+            # not raise the WSAEADDRINUSE this loop depends on to detect
+            # "taken" and advance to the next candidate. Setting it here
+            # used to mean a second QGIS instance could silently "bind" the
+            # same port as the first (self.port ends up identical for both,
+            # and only one process's accept() ever actually receives
+            # traffic) with no error logged anywhere, since bind() reported
+            # success. Let a genuinely-in-use port fail the probe as
+            # intended; there's no listening socket of our own from a prior
+            # run to recover via TIME_WAIT here (stop() closes ours before
+            # any restart would call start() again).
+            try:
+                sock.bind((self.host, candidate))
+            except (OSError, OverflowError) as e:
+                last_error = e
+                sock.close()
+                # Only "this port is already in use" is the expected,
+                # silently-skip-and-try-next-port case. Anything else
+                # (permission denied, bad address, ...) is a real
+                # configuration/environment problem — log it immediately
+                # instead of only surfacing it if every candidate in the
+                # span happens to fail too, which could otherwise mask the
+                # true cause behind an apparently successful start on some
+                # later port.
+                in_use = (
+                    isinstance(e, OSError)
+                    and (e.errno == errno.EADDRINUSE or getattr(e, "winerror", None) == 10048)
+                )
+                if not in_use:
+                    QgsMessageLog.logMessage(
+                        f"Unexpected error binding port {candidate}, trying next: {e}",
+                        "QGIS MCP", Qgis.MessageLevel.Warning,
+                    )
+                continue
+            bound_socket = sock
+            self.port = candidate
+            break
+
+        if bound_socket is None:
+            self.running = False
+            QgsMessageLog.logMessage(
+                f"Failed to bind any port in "
+                f"{port_start}-{port_end - 1}: {last_error}",
+                "QGIS MCP", Qgis.MessageLevel.Critical,
+            )
+            return False
+
+        self._socket = bound_socket
         try:
-            self._socket.bind((self.host, self.port))
             self._socket.listen(1)
             self._socket.setblocking(False)
             self._timer = QTimer()
