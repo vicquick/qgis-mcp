@@ -7,6 +7,7 @@ QGIS 4.x / Qt6 — verified on 4.2.1
 
 import errno
 import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -72,6 +73,19 @@ class QgisMCPServer(QObject):
         self._timer: QTimer | None = None
         self._HANDLERS: dict = {}
         self._sig_cache: dict = {}
+        # Set by the dock: stop, reload modules, start again (reload_plugin).
+        self.request_restart = None
+        # Optional shared secret. Unset (the default) = no check at all. When
+        # set, every command must carry the same value as "_token": the socket
+        # binds to localhost, but any local process could otherwise drive
+        # QGIS, execute_code included. Env wins over the QGIS setting.
+        self._token = os.environ.get("QGIS_MCP_TOKEN") or ""
+        if not self._token:
+            try:
+                from qgis.PyQt.QtCore import QSettings
+                self._token = QSettings().value("QgisMCP/token", "", type=str) or ""
+            except Exception:
+                self._token = ""
 
     def start(self) -> bool:
         """Start listening for connections.
@@ -287,6 +301,10 @@ class QgisMCPServer(QObject):
                            moved, so a cached get_context answer is stale
         Keys appear only when they carry something.
         """
+        if self._token and not hmac.compare_digest(
+                str(command.get("_token", "")).encode("utf-8"), self._token.encode("utf-8")):
+            return {"status": "error", "code": "AUTH",
+                    "message": "this QGIS MCP plugin requires a token (QGIS_MCP_TOKEN)"}
         cmd_type = command.get("type", "")
         params = command.get("params") or {}
         handler = self._HANDLERS.get(cmd_type)

@@ -102,6 +102,20 @@ expressions.""",
   before anything risky (rendering, reloads, atlas loops).""",
     },
     {
+        "slug": "long-export",
+        "title": "Run long exports and Processing as jobs, then look at the output",
+        "severity": "hang",
+        "keywords": "export atlas pdf exportToPdf long timeout busy processing background job",
+        "text": """\
+An atlas or layout export inside execute_code holds the call until it is done;
+past the bridge's timeout the call reports QGIS_BUSY while QGIS keeps working.
+`start_job(kind='atlas_pdf', layout_name=..., path=...)` (or layout_pdf,
+layout_image, atlas_pdfs, processing) returns a job id at once; poll
+`get_job`. Processing jobs run on a worker thread, so QGIS stays usable.
+Afterwards `check_export(path, layout_name)` renders the file and reports blank
+pages, blank map areas and page-count mismatches.""",
+    },
+    {
         "slug": "renderer-clone-pattern",
         "title": "Edit renderers on a clone, then set the whole renderer back",
         "severity": "silent",

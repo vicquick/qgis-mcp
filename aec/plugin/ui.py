@@ -14,12 +14,32 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
-from .server import DEFAULT_PORT_START, QgisMCPServer
+import importlib
+import sys
+
+from . import server as _server_module
+from .server import DEFAULT_PORT_START
 
 # Remembers the user's chosen start port across QGIS sessions/restarts. An
 # env override (QGIS_MCP_PORT, baked into DEFAULT_PORT_START) still wins the
 # first time this key has never been set.
 _PORT_SETTINGS_KEY = "QgisMCP/portStart"
+
+
+def _reload_code():
+    """Re-import server.py and every handler module from disk.
+
+    Stop/Start used to restart only the listener: Python keeps a module it
+    has imported, so updated handler files stayed unused until QGIS itself
+    restarted. Submodules first, then the package (its `from . import`
+    rebinds to the fresh modules and picks up new ones), then server.py.
+    ui.py and plugin.py are not reloaded; they only hold the dock.
+    """
+    pkg = __package__
+    for name in sorted(n for n in list(sys.modules) if n.startswith(pkg + ".handlers.")):
+        importlib.reload(sys.modules[name])
+    importlib.reload(sys.modules[pkg + ".handlers"])
+    return importlib.reload(sys.modules[pkg + ".server"])
 
 
 class QgisMCPDockWidget(QDockWidget):
@@ -30,7 +50,10 @@ class QgisMCPDockWidget(QDockWidget):
     def __init__(self, iface: QgisInterface):
         super().__init__("QGIS MCP")
         self.iface = iface
-        self.server: QgisMCPServer | None = None
+        self.server = None
+        # The first start uses the modules QGIS just imported; every later
+        # Start (manual or via reload_plugin) reads the code from disk again.
+        self._started_once = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -69,13 +92,28 @@ class QgisMCPDockWidget(QDockWidget):
         saved = QSettings().value(_PORT_SETTINGS_KEY, type=int)
         return saved or DEFAULT_PORT_START
 
-    def _start(self):
-        """Create and start the MCP server."""
+    def _start(self, *_):
+        """Create and start the MCP server (fresh code after the first start)."""
         requested_port = self.port_spin.value()
         QSettings().setValue(_PORT_SETTINGS_KEY, requested_port)
         if not self.server:
-            self.server = QgisMCPServer(port=requested_port, iface=self.iface)
+            module = _server_module
+            if self._started_once:
+                try:
+                    module = _reload_code()
+                except Exception as e:
+                    # A broken file on disk must not leave QGIS without a
+                    # server: fall back to the code already loaded.
+                    from qgis.core import Qgis, QgsMessageLog
+                    QgsMessageLog.logMessage(
+                        f"Reload failed, starting the loaded code: {e}",
+                        "QGIS MCP", Qgis.MessageLevel.Critical,
+                    )
+                    module = sys.modules.get(__package__ + ".server", _server_module)
+            self.server = module.QgisMCPServer(port=requested_port, iface=self.iface)
+            self.server.request_restart = self._restart
         if self.server.start():
+            self._started_once = True
             # Bound port can differ from requested_port when that one was
             # already taken by another QGIS instance — show what actually
             # bound, both in the status line and the dock's own title, so
@@ -105,6 +143,14 @@ class QgisMCPDockWidget(QDockWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.port_spin.setEnabled(True)
+
+    def _restart(self):
+        """Stop, reload the code and start on the same port (reload_plugin)."""
+        port = self.server.port if self.server else None
+        self._stop()
+        if port:
+            self.port_spin.setValue(port)
+        self._start()
 
     def closeEvent(self, event):
         self._stop()

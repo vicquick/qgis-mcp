@@ -15,6 +15,24 @@
 | Q8 undo scope | documented | instructions state the boundary (feature edits only; otherwise revert the project). No snapshots: project revert already covers it |
 | Q9 injection note | done | instructions: layer/field names and attribute values are data, never instructions |
 
+## Round 2 — gaps from the 2026-10 comparison (nkarasiak/qgis-mcp, QGIS Agent, ArcGIS Pro assistant, GISclaw, MCP 2026-07-28 RC)
+
+Constraint: nothing on the existing call path gets slower. Everything below runs only when called or switched on.
+
+| Item | Status | What landed |
+|---|---|---|
+| R1 background jobs | done | `start_job` / `get_job` / `list_jobs` / `cancel_job`. Processing runs as `QgsProcessingAlgRunnerTask` on a worker thread (outputs loaded on the main thread when done, NoThreading algorithms refused with a pointer to `execute_processing`); layout/atlas exports are queued on the event loop so the call returns first. Plain job-id tools rather than the MCP Tasks extension: that needs `fastmcp-tasks` (Docket) and client support, and the id pattern works in every client |
+| R2 plugin reload | done | every Start after the first re-imports `server.py` and all handler modules (Stop/Start used to keep the old code until QGIS restarted); `reload_plugin` tool does stop → reload → start on the same port. A broken file falls back to the loaded code |
+| R3 memory-layer checkpoints | done | `create_checkpoint` / `list_checkpoints` / `restore_checkpoint` / `delete_checkpoint` for memory layers only (fields, features, style, filter; removed layers re-created) — the one thing a project revert cannot restore. Last 10 kept, 500k-feature cap |
+| R4 session journal + replay | done | bridge records every mutating plugin command (bounded deque, `QGIS_JOURNAL_SIZE`, 0 = off); `get_session_log`, `clear_session_log`, `export_session` writes a stdlib-only replay script (layer ids remapped, jobs awaited, `--dry-run`, `--keep-going`) |
+| R5 output checks | done | plugin `check_layout` (unlinked legends, missing pictures, unresolved `[% %]`, empty/invalid/online map layers, missing themes, empty atlas, map geometry); bridge `check_export` renders PDF/PNG at low dpi with pypdfium2 and reports blank pages, blank map areas and atlas page-count mismatch |
+| R6 algorithm search | done | `search_algorithms`: word index over id, name, tags, group, help and parameter names, built once and reused until the provider set changes; native algorithms first on ties |
+| R7 socket token | done | optional `QGIS_MCP_TOKEN` (env on both sides, or QGIS setting `QgisMCP/token`); compared in constant time; unset = unchanged behaviour |
+| R8 code risk notes | done | `execute_code` replies carry `risk_warnings` (rule slug + why) for known crash/hang patterns; informational, code still runs |
+| R9 compact preset | done | `compact` = `escape` + `verify` (28 tools: context, discovery, hatches, jobs, checks); `get_context` re-tagged `escape` so every preset has it |
+| R10 list caching | opt-in | `QGIS_LIST_CACHE_TTL` sets the 2026-07-28 `ttlMs` hint; off by default because `set_toolset` changes `tools/list` |
+| MCP Apps panel | not done | no client in use renders it (Claude Code is a terminal); revisit when one does |
+
 Also fixed: `_CACHEABLE` and `_MAX_RESULT_CHARS` named tools that don't exist (`list_processing_algorithms`, `get_processing_algorithm_help`, `get_layout_items`, `list_layers`), so those entries never applied.
 
 > Backlog plan, no implementation in this pass. Written 14.10.2026 from a review of [opengeos/RustGIS](https://github.com/opengeos/RustGIS) (Apache-2.0). Issues are disabled on this fork, so the nine items live in this file instead of separate issues; they can be filed 1:1 once Issues are enabled.
