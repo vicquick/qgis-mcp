@@ -30,6 +30,9 @@ def register(server):
             "port": getattr(s, "port", None),
             "project_path": path,
             "project_title": title,
+            # Lets the bridge tell a plugin with the result envelope and
+            # get_context apart from an older one that is still loaded.
+            "features": ["envelope", "get_context"],
         }
 
     def get_qgis_info(**_):
@@ -113,7 +116,78 @@ def register(server):
         QgsExpressionContextUtils.setProjectVariable(project, name, value)
         return {"name": name, "value": value}
 
+    # Providers whose featureCount() is a cheap local read. Anything else
+    # (postgres, wfs, ...) may run a COUNT(*) or a network request, which has
+    # no place in a call made on every turn.
+    _CHEAP_COUNT = {"memory", "ogr", "spatialite", "delimitedtext"}
+
+    def get_context(since: str = None, max_fields: int = 40, **_):
+        """Compact picture of the project for an agent, in layer-tree order.
+
+        Pass the `rev` of a previous answer as `since`: if nothing an agent
+        relies on changed (see QgisMCPServer.context_rev), only
+        {unchanged, rev} comes back instead of the whole picture.
+        """
+        rev = s.context_rev()
+        if since and since == rev:
+            return {"unchanged": True, "rev": rev}
+        project = QgsProject.instance()
+        layers = project.mapLayers()
+        out = []
+        for node in project.layerTreeRoot().findLayers():
+            layer = layers.get(node.layerId())
+            if layer is None:
+                continue
+            item = {
+                "id": layer.id(),
+                "name": layer.name(),
+                "type": s.layer_type_str(layer),
+                "visible": node.isVisible(),
+                "crs": layer.crs().authid(),
+            }
+            if layer.type() == Qgis.LayerType.Vector:
+                provider = layer.providerType()
+                item["provider"] = provider
+                if provider in _CHEAP_COUNT:
+                    item["features"] = layer.featureCount()
+                fields = layer.fields()
+                item["fields"] = [f"{f.name()}:{f.typeName()}" for f in list(fields)[:max_fields]]
+                if fields.count() > max_fields:
+                    item["fields_more"] = fields.count() - max_fields
+                if layer.subsetString():
+                    item["filter"] = layer.subsetString()
+                if layer.isEditable():
+                    item["editing"] = True
+                if layer.selectedFeatureCount():
+                    item["selected"] = layer.selectedFeatureCount()
+            out.append(item)
+        ctx = {
+            "rev": rev,
+            "project": {
+                "title": project.title(),
+                "path": project.fileName(),
+                "crs": project.crs().authid(),
+                "dirty": project.isDirty(),
+                "layouts": len(project.layoutManager().layouts()),
+            },
+            "layers": out,
+        }
+        try:
+            canvas = s.iface.mapCanvas()
+            ctx["canvas"] = {
+                "scale": round(canvas.scale()),
+                "extent": s.extent_to_dict(canvas.extent()),
+                "crs": canvas.mapSettings().destinationCrs().authid(),
+            }
+            active = s.iface.activeLayer()
+            if active is not None:
+                ctx["active_layer"] = active.id()
+        except Exception:
+            pass  # headless / no iface: the project picture still stands
+        return ctx
+
     s._HANDLERS.update({
+        "get_context": get_context,
         "ping": ping,
         "get_qgis_info": get_qgis_info,
         "get_project_info": get_project_info,

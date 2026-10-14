@@ -57,6 +57,13 @@ TOOL_TAGS = {
     # in a narrow preset with no way to widen it again.
     'set_toolset': 'escape',
     'execute_processing': 'escape',
+    # Discovery and rules ride on 'escape' for the same reason: from the
+    # narrowest preset they are the way to everything else.
+    'search_tools': 'escape',
+    'describe_tool': 'escape',
+    'run_tool': 'escape',
+    'search_rules': 'escape',
+    'get_context': 'project',
     'execute_sql': 'database',
     'export_atlas': 'layouts',
     'export_dxf': 'layouts',
