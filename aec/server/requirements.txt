@@ -1,2 +1,21 @@
-mcp[cli]>=1.27.0
-pillow>=10.4
+# qgis-mcp server deps. Migrated bundled mcp.server.fastmcp -> standalone
+# fastmcp 3.x: the bundled build has no tags, no per-tool timeout and no
+# middleware, so toolset presets, call timeouts, response caching and the
+# progress heartbeat were all unreachable. This file still pinned the
+# pre-migration `mcp[cli]` until 2026-09-07 — the deployed venv had been on
+# fastmcp for months.
+#
+# 4.0.3 (2026-09): moved off 3.4.7 now that the 4.x line is GA. The risk was
+# output-schema handling, where the `output_schema=None` in qtool() lives —
+# without it every tool emits an outputSchema derived from its `-> str` return
+# and clients have historically dropped the whole tool set. Verified after the
+# upgrade: tools/list = 172 tools, 0 with outputSchema, in-process and over
+# streamable HTTP on :8081, with a live ping through to QGIS. MCP SDK v2
+# (mcp 2.1.1) keeps `from mcp.types import ToolAnnotations, TextContent`
+# working, and tool(timeout=/tags=/annotations=/meta=), enable(tags=, only=True),
+# the middleware stack and run()'s host/port/uvicorn_config are unchanged.
+# Re-verify tools/list emits no outputSchema before moving this pin again.
+fastmcp==4.0.3
+
+# window capture for the screenshot tool
+pillow>=11.0

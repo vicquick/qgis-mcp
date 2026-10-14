@@ -6,10 +6,15 @@ FROM python:3.13-slim-trixie
 # container (aec-web) on port 9877
 # ============================================================
 
-RUN pip install --no-cache-dir "mcp[cli]>=1.3.0"
-
 WORKDIR /app
-COPY qgis_mcp_server.py ./
+
+# The server imports standalone fastmcp (see requirements.txt). This used to
+# install only "mcp[cli]", so a clean build failed on `from fastmcp import ...`.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# The server imports its sibling modules (tool tags, rules), not just itself.
+COPY *.py ./
 
 ENV DESKTOP_HOST=aec-web
 ENV QGIS_MCP_PORT=9877
