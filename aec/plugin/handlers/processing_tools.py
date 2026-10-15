@@ -89,11 +89,24 @@ def register(server):
         Returns algorithm outputs as strings.
         """
         import processing
+        from qgis.core import QgsApplication
+        # processing.run() drops parameter names the algorithm doesn't define
+        # and runs on defaults, so a misspelt key (INPUT_LAYER for INPUT)
+        # silently produced a different result. Report them instead.
+        ignored = []
+        alg = QgsApplication.processingRegistry().algorithmById(algorithm)
+        if alg is not None:
+            known = {d.name() for d in alg.parameterDefinitions()}
+            ignored = sorted(k for k in (parameters or {}) if k not in known)
         result = processing.run(algorithm, parameters)
-        return {
+        out = {
             "algorithm": algorithm,
             "result": {k: str(v) for k, v in result.items()},
         }
+        if ignored:
+            out["ignored_parameters"] = ignored
+            out["valid_parameters"] = sorted(known)
+        return out
 
     def list_processing_providers(**_):
         """List available processing providers (native, GDAL, GRASS, etc.)."""

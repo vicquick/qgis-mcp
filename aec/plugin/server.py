@@ -6,12 +6,14 @@ QGIS 4.x / Qt6 — verified on 4.2.1
 """
 
 import errno
+import hashlib
+import inspect
 import json
 import os
 import socket
 import traceback
 
-from qgis.core import Qgis, QgsMessageLog, QgsProject, QgsMapLayer, QgsRectangle
+from qgis.core import Qgis, QgsApplication, QgsMessageLog, QgsProject, QgsMapLayer, QgsRectangle
 from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import QObject, QTimer
 
@@ -69,6 +71,7 @@ class QgisMCPServer(QObject):
         self._buffer = b""
         self._timer: QTimer | None = None
         self._HANDLERS: dict = {}
+        self._sig_cache: dict = {}
 
     def start(self) -> bool:
         """Start listening for connections.
@@ -272,23 +275,139 @@ class QgisMCPServer(QObject):
             )
 
     def _execute(self, command: dict) -> dict:
-        """Dispatch a command to the appropriate handler."""
+        """Dispatch a command to the appropriate handler.
+
+        Besides {status, result} the reply says what the call did to the
+        project, so an agent can chain the next step without a separate
+        get_layers/get_message_log round trip:
+          layers_added / layers_removed  [{id, name}] — ids for the next call
+          notices          QGIS warnings/errors logged while the handler ran
+          ignored_params   arguments the handler swallowed in its **_ catch-all
+          context_changed  + rev: the project fingerprint (see context_rev)
+                           moved, so a cached get_context answer is stale
+        Keys appear only when they carry something.
+        """
         cmd_type = command.get("type", "")
-        params = command.get("params", {})
+        params = command.get("params") or {}
         handler = self._HANDLERS.get(cmd_type)
         if not handler:
             return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+        ignored = self._ignored_params(handler, params)
+        project = QgsProject.instance()
+        before = {lid: l.name() for lid, l in project.mapLayers().items()}
+        rev_before = self.context_rev()
+        notices = []
+
+        # Scoped to this one call: connected right before the handler runs and
+        # disconnected in finally. Everything happens on the main thread (the
+        # QTimer slot), so log lines from another call cannot land here; lines
+        # a worker thread logs are queued and arrive after we disconnect.
+        def on_message(message, tag, level):
+            try:
+                # Membership, not `<`: QGIS 4 enums are not guaranteed ordered.
+                if tag == "QGIS MCP" or level not in (
+                        Qgis.MessageLevel.Warning, Qgis.MessageLevel.Critical):
+                    return
+                if len(notices) < 20:
+                    text = str(message)
+                    notices.append(f"[{tag or 'QGIS'}] {text[:300]}")
+            except Exception:
+                pass
+
+        log = QgsApplication.messageLog()
+        log.messageReceived.connect(on_message)
         try:
             QgsMessageLog.logMessage(
                 f"Executing: {cmd_type}", "QGIS MCP", Qgis.MessageLevel.Info,
             )
-            return {"status": "success", "result": handler(**params)}
+            response = {"status": "success", "result": handler(**params)}
         except Exception as e:
             tb = traceback.format_exc()
             QgsMessageLog.logMessage(
                 f"Error in {cmd_type}: {e}\n{tb}", "QGIS MCP", Qgis.MessageLevel.Critical,
             )
-            return {"status": "error", "message": str(e), "traceback": tb}
+            response = {"status": "error", "message": str(e), "traceback": tb}
+        finally:
+            try:
+                log.messageReceived.disconnect(on_message)
+            except Exception:
+                pass
+
+        try:
+            after = {lid: l.name() for lid, l in project.mapLayers().items()}
+            added = [{"id": lid, "name": n} for lid, n in after.items() if lid not in before]
+            removed = [{"id": lid, "name": n} for lid, n in before.items() if lid not in after]
+            if added:
+                response["layers_added"] = added
+            if removed:
+                response["layers_removed"] = removed
+            if notices:
+                response["notices"] = notices
+            if ignored:
+                response["ignored_params"] = ignored
+            rev_after = self.context_rev()
+            if rev_after != rev_before:
+                response["context_changed"] = True
+                response["rev"] = rev_after
+        except Exception as e:
+            # The envelope is a convenience; never let it turn a call that
+            # succeeded into a failure.
+            QgsMessageLog.logMessage(
+                f"Envelope for {cmd_type} failed: {e}", "QGIS MCP", Qgis.MessageLevel.Warning,
+            )
+        return response
+
+    def _ignored_params(self, handler, params: dict) -> list:
+        """Arguments the handler accepts only through a **_ catch-all.
+
+        Most handlers end in **_ so an extra key never raises — which also
+        meant a misspelt argument (layer instead of layer_id, colour instead of
+        color) was dropped without a word and the call ran on defaults.
+        """
+        sig = self._sig_cache.get(handler)
+        if sig is None:
+            try:
+                ps = inspect.signature(handler).parameters.values()
+                named = {p.name for p in ps if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)}
+                catch_all = any(p.kind == p.VAR_KEYWORD for p in ps)
+                sig = (named, catch_all)
+            except (TypeError, ValueError):
+                sig = (set(), False)
+            self._sig_cache[handler] = sig
+        named, catch_all = sig
+        if not catch_all:
+            return []  # an unknown key raises TypeError, which already reports it
+        return sorted(k for k in params if k not in named)
+
+    @staticmethod
+    def context_rev() -> str:
+        """Short fingerprint of what an agent's picture of the project rests on.
+
+        Covers project file and CRS, layer order, ids, names, visibility, CRS,
+        field names and subset filters. Not features, not styles: those change
+        too often to be useful here and are cheap to re-read on demand. Cheap
+        enough to run before and after every call.
+        """
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        h = hashlib.sha1()
+        h.update(f"{project.fileName()}|{project.crs().authid()}".encode("utf-8"))
+        layers = project.mapLayers()
+        seen = set()
+        for node in root.findLayers():
+            lid = node.layerId()
+            layer = layers.get(lid)
+            if layer is None:
+                continue
+            seen.add(lid)
+            parts = [lid, layer.name(), "1" if node.isVisible() else "0", layer.crs().authid()]
+            if layer.type() == Qgis.LayerType.Vector:
+                parts.append(",".join(layer.fields().names()))
+                parts.append(layer.subsetString())
+            h.update(("\n" + "|".join(parts)).encode("utf-8"))
+        for lid in sorted(set(layers) - seen):  # layers kept out of the tree
+            h.update(f"\n{lid}|{layers[lid].name()}".encode("utf-8"))
+        return h.hexdigest()[:12]
 
     # ── Utility methods used by handlers ─────────────────────────
 
