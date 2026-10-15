@@ -6,8 +6,10 @@ Everything here is a read: it reports, it never changes the layout.
 """
 
 import os
+import re
 
 from qgis.core import (
+    QgsExpression,
     QgsLayoutItemLabel,
     QgsLayoutItemLegend,
     QgsLayoutItemMap,
@@ -16,6 +18,8 @@ from qgis.core import (
     QgsProject,
     QgsUnitTypes,
 )
+
+_EXPR_RE = re.compile(r"\[%(.*?)%\]", re.S)
 
 # Providers whose tiles come over the network and can render blank on a page
 # while the export still reports success.
@@ -126,12 +130,14 @@ def register(server):
                         ("http", "base64:")) and not os.path.exists(path):
                     issue("error", iid, f"picture file missing: {path}")
             elif isinstance(item, QgsLayoutItemLabel):
-                try:
-                    text = item.currentText()
-                except Exception:
-                    text = ""
-                if "[%" in text:
-                    issue("warning", iid, "label has an unresolved [% %] expression")
+                # currentText() is only evaluated once an atlas page rendered,
+                # so "[%" in it says nothing. Parse each expression instead and
+                # report the ones that cannot work on any page.
+                for expr in _EXPR_RE.findall(item.text() or ""):
+                    e = QgsExpression(expr)
+                    if e.hasParserError():
+                        issue("error", iid, f"label expression does not parse: "
+                              f"{expr.strip()[:80]} ({e.parserErrorString()[:120]})")
 
         return {
             "layout": layout_name,

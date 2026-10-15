@@ -1431,7 +1431,7 @@ def search_algorithms(ctx: Context, query: str, limit: int = 10) -> str:
 @qtool
 def check_layout(ctx: Context, layout_name: str) -> str:
     """Pre-export check of a print layout: legends without a linked map,
-    missing picture files, unresolved [% %] labels, maps with no, invalid or
+    missing picture files, [% %] label expressions that do not parse, maps with no, invalid or
     online layers, missing themes, empty atlas. Read-only."""
     return cmd("check_layout", {"layout_name": layout_name})
 
