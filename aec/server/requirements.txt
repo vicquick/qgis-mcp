@@ -19,3 +19,7 @@ fastmcp==4.0.3
 
 # window capture for the screenshot tool
 pillow>=11.0
+
+# check_export renders exported PDFs to look for blank pages and map areas
+# (Apache-2.0/BSD; imported lazily, so the server starts without it)
+pypdfium2>=5.14

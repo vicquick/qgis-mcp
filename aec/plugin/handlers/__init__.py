@@ -12,11 +12,13 @@ from . import (
     features,
     geoprocessing,
     history,
+    jobs,
     labeling,
     layers,
     layouts,
     processing_tools,
     project,
+    quality,
     raster,
     relations,
     settings,
@@ -46,6 +48,8 @@ _MODULES = [
     validation,
     export,
     geoprocessing,
+    jobs,
+    quality,
 ]
 
 

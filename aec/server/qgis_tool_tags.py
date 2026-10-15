@@ -63,7 +63,25 @@ TOOL_TAGS = {
     'describe_tool': 'escape',
     'run_tool': 'escape',
     'search_rules': 'escape',
-    'get_context': 'project',
+    # get_context is where every session starts, so the compact preset keeps it.
+    'get_context': 'escape',
+    # Jobs and algorithm search back up execute_processing, which is 'escape':
+    # a narrow preset must still be able to run and find long algorithms.
+    'start_job': 'escape',
+    'get_job': 'escape',
+    'list_jobs': 'escape',
+    'cancel_job': 'escape',
+    'search_algorithms': 'escape',
+    'create_checkpoint': 'editing',
+    'list_checkpoints': 'editing',
+    'restore_checkpoint': 'editing',
+    'delete_checkpoint': 'editing',
+    'reload_plugin': 'settings',
+    'check_layout': 'verify',
+    'check_export': 'verify',
+    'get_session_log': 'project',
+    'clear_session_log': 'project',
+    'export_session': 'project',
     'execute_sql': 'database',
     'export_atlas': 'layouts',
     'export_dxf': 'layouts',
@@ -196,6 +214,9 @@ PRESETS = {
     'data': {'io', 'escape', 'database', 'analysis', 'layers', 'forms', 'project', 'features', 'verify', 'data'},
     'geoprocess': {'escape', 'geoprocessing', 'raster', 'layers', 'verify', 'project', 'features', 'processing', 'analysis'},
     'minimal': {'escape', 'verify', 'layers', 'project'},
+    # Smallest useful surface: context, discovery (search_tools/run_tool reach
+    # everything else), the code and Processing hatches, jobs and checks.
+    'compact': {'escape', 'verify'},
 }
 
 

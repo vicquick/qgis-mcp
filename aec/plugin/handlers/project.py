@@ -32,8 +32,24 @@ def register(server):
             "project_title": title,
             # Lets the bridge tell a plugin with the result envelope and
             # get_context apart from an older one that is still loaded.
-            "features": ["envelope", "get_context"],
+            "features": ["envelope", "get_context", "jobs", "checkpoints",
+                         "search_algorithms", "check_layout", "reload_plugin", "token"],
         }
+
+    def reload_plugin(**_):
+        """Load the plugin's code fresh from disk without restarting QGIS.
+
+        Stops the socket server, re-imports server.py and every handler
+        module, and starts again on the same port. The reply goes out first;
+        the connection then drops and the bridge reconnects on the next call.
+        Jobs and checkpoints held in memory are cleared."""
+        from qgis.PyQt.QtCore import QTimer
+        restart = getattr(s, "request_restart", None)
+        if restart is None:
+            raise RuntimeError("this plugin build cannot restart itself; "
+                               "use Stop/Start in the QGIS MCP dock")
+        QTimer.singleShot(300, restart)
+        return {"reloading": True, "port": getattr(s, "port", None)}
 
     def get_qgis_info(**_):
         """Return QGIS version, Qt version, profile path, and plugin count."""
@@ -189,6 +205,7 @@ def register(server):
     s._HANDLERS.update({
         "get_context": get_context,
         "ping": ping,
+        "reload_plugin": reload_plugin,
         "get_qgis_info": get_qgis_info,
         "get_project_info": get_project_info,
         "load_project": load_project,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QGIS MCP Server — socket proxy to QGIS plugin (177 tools)
+QGIS MCP Server — socket proxy to QGIS plugin (192 tools)
 Connects to the QGIS MCP plugin running inside the desktop container.
 """
 
@@ -66,6 +66,16 @@ QGIS_CALL_TIMEOUT = float(os.environ.get("QGIS_CALL_TIMEOUT", "900"))
 QGIS_HEARTBEAT = float(os.environ.get("QGIS_HEARTBEAT", "20"))
 # Read-only response cache TTL, applied ONLY to the allowlist below.
 QGIS_CACHE_TTL = int(os.environ.get("QGIS_CACHE_TTL", "30"))
+# Optional shared secret, sent with every command. Must match the plugin's
+# QGIS_MCP_TOKEN (env or QGIS setting QgisMCP/token). Unset = no auth, as before.
+QGIS_MCP_TOKEN = os.environ.get("QGIS_MCP_TOKEN", "")
+# Session journal: every mutating plugin command, for get_session_log and
+# export_session. A bounded deque append per call; 0 disables.
+QGIS_JOURNAL_SIZE = int(os.environ.get("QGIS_JOURNAL_SIZE", "1000"))
+# Client-side caching hint (ttlMs) for tools/list and resources, in seconds.
+# Off by default: set_toolset changes tools/list, and only clients speaking the
+# 2026-07-28 protocol honour it anyway.
+QGIS_LIST_CACHE_TTL = int(os.environ.get("QGIS_LIST_CACHE_TTL", "0"))
 
 
 class QgisMCPServer:
@@ -103,6 +113,8 @@ class QgisMCPServer:
         """
         cid = uuid.uuid4().hex[:8]
         command = {"type": command_type, "params": params or {}, "_cid": cid}
+        if QGIS_MCP_TOKEN:
+            command["_token"] = QGIS_MCP_TOKEN
         payload = json.dumps(command).encode("utf-8") + b"\n"
         t0 = time.perf_counter()
         try:
@@ -218,8 +230,10 @@ def _scan_instances(timeout: float = 0.5):
         resp = None
         try:
             s.connect((QGIS_HOST, port))
-            payload = json.dumps({"type": "ping", "params": {},
-                                  "_cid": uuid.uuid4().hex[:8]}).encode("utf-8") + b"\n"
+            probe = {"type": "ping", "params": {}, "_cid": uuid.uuid4().hex[:8]}
+            if QGIS_MCP_TOKEN:
+                probe["_token"] = QGIS_MCP_TOKEN
+            payload = json.dumps(probe).encode("utf-8") + b"\n"
             s.sendall(payload)
             data = b""
             while b"\n" not in data:
@@ -291,6 +305,57 @@ def get_qgis_connection():
     raise Exception(f"Could not connect to QGIS at {QGIS_HOST}:{_active_port}. Start the plugin first.")
 
 
+import collections
+
+_JOURNAL = collections.deque(maxlen=max(QGIS_JOURNAL_SIZE, 1))
+_JOURNAL_SEQ = 0
+_JOURNAL_LOCK = threading.Lock()
+# Plugin commands that change nothing, beyond the name rules in _is_read_cmd.
+_READ_CMDS = frozenset({"ping", "get_job", "list_jobs", "list_checkpoints",
+                        "search_algorithms", "check_layout", "render_map",
+                        "algorithm_help", "layer_diff", "calculate_statistics",
+                        "spatial_query", "transform_coordinates", "get_context"})
+
+
+def _is_read_cmd(command_type):
+    return command_type in _READ_CMDS or command_type.startswith(_RO_PREFIXES)
+
+
+def _journal(command_type, params, resp):
+    """Record one mutating command for get_session_log / export_session."""
+    global _JOURNAL_SEQ
+    if QGIS_JOURNAL_SIZE <= 0:
+        return
+    if _is_read_cmd(command_type):
+        # A finished job reports the layers it added only when polled: copy
+        # them onto the start_job entry so a replay can map their ids.
+        if command_type == "get_job" and isinstance(resp, dict):
+            res = resp.get("result") or {}
+            if res.get("state") == "done" and res.get("layers_added"):
+                with _JOURNAL_LOCK:
+                    for e in _JOURNAL:
+                        if e["type"] == "start_job" and e.get("job_id") == res.get("id"):
+                            e["layers_added"] = [l["id"] for l in res["layers_added"]]
+        return
+    ok = isinstance(resp, dict) and resp.get("status") == "success"
+    entry = {
+        "t": time.strftime("%H:%M:%S"),
+        "port": _active_port,
+        "type": command_type,
+        "params": params or {},
+        "ok": ok,
+        "layers_added": [l["id"] for l in (resp.get("layers_added") or [])] if ok else [],
+    }
+    if command_type == "start_job" and ok:
+        entry["job_id"] = (resp.get("result") or {}).get("id")
+    if not ok and isinstance(resp, dict):
+        entry["error"] = str(resp.get("message") or resp.get("error") or "")[:200]
+    with _JOURNAL_LOCK:
+        _JOURNAL_SEQ += 1
+        entry["seq"] = _JOURNAL_SEQ
+        _JOURNAL.append(entry)
+
+
 def cmd(command_type, params=None):
     """Send command and return JSON string.
 
@@ -298,8 +363,12 @@ def cmd(command_type, params=None):
     indentation was paid on every result of every call. ensure_ascii=False
     keeps German layer and field names as real characters instead of escapes.
     """
-    return json.dumps(get_qgis_connection().send_command(command_type, params),
-                      ensure_ascii=False, separators=(",", ":"))
+    resp = get_qgis_connection().send_command(command_type, params)
+    try:
+        _journal(command_type, params, resp)
+    except Exception as e:  # the journal must never cost a call its result
+        logger.warning(f"journal: {e}")
+    return json.dumps(resp, ensure_ascii=False, separators=(",", ":"))
 
 
 @asynccontextmanager
@@ -356,9 +425,19 @@ mcp = FastMCP(
         'layout clones, expression functions, reloads) read search_rules: known '
         'crash and silent-failure patterns, also as resources qgis://rules/<slug>. '
         'Multiple QGIS windows may be running: list_qgis_instances discovers them '
-        'and select_qgis_instance picks which one every other tool talks to.'
+        'and select_qgis_instance picks which one every other tool talks to. '
+        'Long work: start_job runs a Processing algorithm in the background or '
+        'queues a layout/atlas export and returns a job id; poll get_job. '
+        'search_algorithms finds Processing algorithms by what they do. '
+        'After an export, check_export looks at the file (blank pages, blank map '
+        'areas, page count) - export success codes do not; check_layout lists '
+        'problems before exporting. create_checkpoint saves memory layers, which '
+        'a project revert cannot bring back. get_session_log/export_session show '
+        'and replay what this session changed.'
     ),
-    lifespan=server_lifespan
+    lifespan=server_lifespan,
+    # Only clients on the 2026-07-28 protocol honour it; see QGIS_LIST_CACHE_TTL.
+    **({"cache_ttl": QGIS_LIST_CACHE_TTL} if QGIS_LIST_CACHE_TTL > 0 else {}),
 )
 
 
@@ -1200,8 +1279,383 @@ def execute_code(ctx: Context, code: str) -> str:
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle, QgsPointXY,
     QgsMapSettings, QgsSymbol, QgsMarkerSymbol, QgsLineSymbol, QgsFillSymbol,
     QgsPrintLayout, QgsLayoutExporter, QgsLayoutItemMap, QgsPalLayerSettings,
-    QgsTextFormat, QgsProperty, QgsExpression, processing, iface, canvas, and many more."""
-    return cmd("execute_code", {"code": code})
+    QgsTextFormat, QgsProperty, QgsExpression, processing, iface, canvas, and many more.
+    Code matching a known crash or hang pattern still runs; the reply then
+    carries risk_warnings naming the rule (search_rules) with the safe way."""
+    warnings = _code_risks(code)
+    out = cmd("execute_code", {"code": code})
+    if not warnings:
+        return out
+    try:
+        resp = json.loads(out)
+        resp["risk_warnings"] = warnings
+        return json.dumps(resp, ensure_ascii=False, separators=(",", ":"))
+    except ValueError:
+        return out
+
+
+import re as _re
+
+# (rule slug, pattern, extra condition, why). Informational only: matching
+# code is never refused. Plain regex over the source, microseconds per call.
+_CODE_RISKS = [
+    ("no-project-write", _re.compile(r"QgsProject\.instance\(\)\.write\s*\(|\b(project|proj|prj|p)\.write\s*\("),
+     None, "QgsProject.write() from the plugin's socket slot has crashed QGIS"),
+    ("qgsfunction-register-once", _re.compile(r"@qgsfunction|qgsfunction\s*\("),
+     None, "registering an expression function twice in one QGIS session has crashed it"),
+    ("render-deadlock-layer-expressions", _re.compile(r"waitForFinished\s*\("),
+     None, "waitForFinished with layer-referencing expressions has frozen QGIS"),
+    ("layout-clone-render", _re.compile(r"\.clone\s*\(\s*\)"),
+     _re.compile(r"[Ll]ayout|atlas"), "layout clone + atlas rendering has corrupted the heap"),
+    ("execute-code-hazards", _re.compile(r"sys\.executable|atlas\(\)\.currentFeature\s*\("),
+     None, "sys.executable is the QGIS binary; atlas.currentFeature() mid-render crashed"),
+    ("long-export", _re.compile(r"exportTo(Pdf|Pdfs|Image|Svg)\s*\("),
+     None, "a long export blocks this call; start_job(kind=atlas_pdf|layout_pdf...) "
+           "returns at once, then check_export looks at the result"),
+]
+
+
+def _code_risks(code):
+    found = []
+    for slug, pattern, also, why in _CODE_RISKS:
+        if pattern.search(code or "") and (also is None or also.search(code)):
+            found.append({"rule": slug, "why": why})
+    return found
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Background jobs, checkpoints, plugin reload
+# ═══════════════════════════════════════════════════════════════════
+
+@qtool
+def start_job(ctx: Context, kind: str = "processing", algorithm: str = None,
+              parameters: dict = None, load_outputs: bool = True,
+              layout_name: str = None, path: str = None, dpi: int = 300) -> str:
+    """Start a long run and get a job id back at once; poll get_job.
+    kind=processing: algorithm + parameters on a worker thread, QGIS stays
+    usable, layer outputs are added to the project when done (load_outputs).
+    kind=layout_pdf | layout_image | atlas_pdf (one file) | atlas_pdfs (path is
+    a folder, one PDF per page): exports render on the QGIS main thread, so
+    QGIS is busy until done. Follow an export with check_export."""
+    p = {"kind": kind, "load_outputs": load_outputs, "dpi": dpi}
+    for k, v in (("algorithm", algorithm), ("parameters", parameters),
+                 ("layout_name", layout_name), ("path", path)):
+        if v is not None:
+            p[k] = v
+    return cmd("start_job", p)
+
+
+@qtool
+def get_job(ctx: Context, job_id: str) -> str:
+    """State of a job from start_job: queued | running | done | failed |
+    canceled, with progress (processing), elapsed or duration, result, the
+    layers it added and the algorithm's warnings."""
+    return cmd("get_job", {"job_id": job_id})
+
+
+@qtool
+def list_jobs(ctx: Context) -> str:
+    """All jobs started in this QGIS session (a plugin reload clears them)."""
+    return cmd("list_jobs")
+
+
+@qtool
+def cancel_job(ctx: Context, job_id: str) -> str:
+    """Cancel a running Processing job. Exports cannot be stopped once rendering."""
+    return cmd("cancel_job", {"job_id": job_id})
+
+
+@qtool
+def create_checkpoint(ctx: Context, name: str = None, layer_ids: list = None) -> str:
+    """Save the memory (scratch) layers — features, fields, style, filter — so
+    restore_checkpoint can put them back. Reverting the project restores saved
+    layers but loses memory layers; this covers that gap. Default: all memory
+    layers. Held in QGIS memory, last 10 kept, cleared by a plugin reload."""
+    p = {}
+    if name: p["name"] = name
+    if layer_ids: p["layer_ids"] = layer_ids
+    return cmd("create_checkpoint", p)
+
+
+@qtool
+def list_checkpoints(ctx: Context) -> str:
+    """Checkpoints of memory layers in this QGIS session."""
+    return cmd("list_checkpoints")
+
+
+@qtool
+def restore_checkpoint(ctx: Context, checkpoint: str) -> str:
+    """Put memory layers back to a checkpoint (features, fields, style,
+    filter). A layer removed since is re-created with a new id; feature ids
+    are renumbered."""
+    return cmd("restore_checkpoint", {"checkpoint": checkpoint})
+
+
+@qtool
+def delete_checkpoint(ctx: Context, checkpoint: str) -> str:
+    """Drop a checkpoint and free its memory."""
+    return cmd("delete_checkpoint", {"checkpoint": checkpoint})
+
+
+@qtool
+def reload_plugin(ctx: Context) -> str:
+    """Load the QGIS-side plugin code fresh from disk without restarting QGIS
+    (after an update). The plugin restarts on the same port; the next call
+    reconnects by itself. Jobs and checkpoints in memory are cleared."""
+    out = cmd("reload_plugin")
+    # The plugin closes this socket a moment after replying. Drop it now so
+    # the next call reconnects instead of tripping over the closed stream.
+    try:
+        conn = _qgis_pool.get(_active_port)
+        if conn is not None:
+            with conn._lock:
+                conn.disconnect()
+    except Exception:
+        pass
+    return out
+
+
+@qtool
+def search_algorithms(ctx: Context, query: str, limit: int = 10) -> str:
+    """Find Processing algorithms by what they do ("points in polygon",
+    "raster to vector", "dissolve by attribute"), ranked over id, name, tags,
+    group, help text and parameter names, native ones first on ties. Returns
+    parameter names too, so execute_processing or start_job can follow."""
+    return cmd("search_algorithms", {"query": query, "limit": limit})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Output checks
+# ═══════════════════════════════════════════════════════════════════
+
+@qtool
+def check_layout(ctx: Context, layout_name: str) -> str:
+    """Pre-export check of a print layout: legends without a linked map,
+    missing picture files, [% %] label expressions that do not parse, maps with no, invalid or
+    online layers, missing themes, empty atlas. Read-only."""
+    return cmd("check_layout", {"layout_name": layout_name})
+
+
+def _region_std(img, box):
+    from PIL import ImageStat
+    w, h = img.size
+    x0, y0, x1, y1 = (max(0, min(w, int(box[0]))), max(0, min(h, int(box[1]))),
+                      max(0, min(w, int(box[2]))), max(0, min(h, int(box[3]))))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    return ImageStat.Stat(img.crop((x0, y0, x1, y1))).stddev[0]
+
+
+@qtool
+def check_export(ctx: Context, path: str, layout_name: str = None, dpi: int = 40,
+                 max_pages: int = 300) -> str:
+    """Look at an exported PDF or image instead of trusting the export's
+    success code: blank pages, and — with layout_name — map areas that came
+    out uniform (a WMS that did not load), page count vs the atlas, plus the
+    layout's own check_layout issues. Renders at low dpi on the bridge side;
+    QGIS is not involved beyond check_layout."""
+    if not os.path.exists(path):
+        return json.dumps({"error": f"no file at {path}"}, ensure_ascii=False)
+    layout = None
+    if layout_name:
+        try:
+            resp = json.loads(cmd("check_layout", {"layout_name": layout_name}))
+            layout = resp.get("result") if resp.get("status") == "success" else None
+            if layout is None:
+                return json.dumps({"error": f"check_layout failed: {resp}"}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"error": f"check_layout: {e}"})
+
+    from PIL import Image as PILImage
+    images = []  # (index, PIL image L-mode, width_pt or None)
+    ext = os.path.splitext(path)[1].lower()
+    total = 0
+    if ext == ".pdf":
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            return json.dumps({"error": "check_export needs pypdfium2 in the bridge venv "
+                                        "(pip install pypdfium2)"})
+        pdf = pdfium.PdfDocument(path)
+        try:
+            total = len(pdf)
+            for i in range(min(total, max(1, int(max_pages)))):
+                page = pdf[i]
+                bmp = page.render(scale=max(10, int(dpi)) / 72.0)
+                images.append((i, bmp.to_pil().convert("L")))
+                page.close()
+        finally:
+            pdf.close()
+    else:
+        img = PILImage.open(path)
+        total = 1
+        images.append((0, img.convert("L")))
+
+    from PIL import ImageStat
+    blank_pages, blank_maps = [], []
+    n_layout_pages = len(layout["pages"]) if layout else 1
+    for i, img in images:
+        if ImageStat.Stat(img).stddev[0] < 2.0:
+            blank_pages.append(i + 1)
+            continue
+        if not layout or not layout.get("units_mm", True):
+            continue
+        lp = layout["pages"][i % n_layout_pages]
+        px_per_mm = img.size[0] / lp["width"] if lp["width"] else 0
+        for m in layout["maps"]:
+            if m["page"] != i % n_layout_pages or not px_per_mm:
+                continue
+            # Inset 5 % so frames and neighbouring items do not count as content.
+            ix, iy = m["width"] * 0.05, m["height"] * 0.05
+            std = _region_std(img, ((m["x"] + ix) * px_per_mm, (m["y"] + iy) * px_per_mm,
+                                    (m["x"] + m["width"] - ix) * px_per_mm,
+                                    (m["y"] + m["height"] - iy) * px_per_mm))
+            if std is not None and std < 3.0:
+                blank_maps.append({"page": i + 1, "map": m["id"], "std": round(std, 2)})
+
+    out = {"path": path, "pages": total, "checked": len(images),
+           "blank_pages": blank_pages, "blank_map_areas": blank_maps}
+    if layout:
+        atlas = layout.get("atlas") or {}
+        if atlas.get("enabled") and ext == ".pdf" and atlas.get("count"):
+            expected = atlas["count"] * n_layout_pages
+            out["expected_pages"] = expected
+            if total not in (expected, n_layout_pages):
+                out["page_count_mismatch"] = True
+        out["layout_issues"] = layout.get("issues", [])
+    out["ok"] = not (blank_pages or blank_maps or out.get("page_count_mismatch")
+                     or any(i.get("severity") == "error" for i in out.get("layout_issues", [])))
+    return json.dumps(out, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Session journal
+# ═══════════════════════════════════════════════════════════════════
+
+@qtool
+def get_session_log(ctx: Context, limit: int = 50, include_params: bool = False) -> str:
+    """What this bridge changed in QGIS so far: every mutating command in
+    order (time, instance port, command, ok/error, layers it added). Read
+    calls are not logged. include_params adds the full arguments."""
+    with _JOURNAL_LOCK:
+        entries = list(_JOURNAL)[-max(1, min(int(limit or 50), 1000)):]
+    if not include_params:
+        entries = [{k: v for k, v in e.items() if k != "params"} for e in entries]
+    return json.dumps({"total": _JOURNAL_SEQ, "kept": len(_JOURNAL), "entries": entries},
+                      ensure_ascii=False, default=str)
+
+
+@qtool
+def clear_session_log(ctx: Context) -> str:
+    """Empty the session journal (e.g. before a sequence you want to export)."""
+    with _JOURNAL_LOCK:
+        n = len(_JOURNAL)
+        _JOURNAL.clear()
+    return json.dumps({"cleared": n})
+
+
+_REPLAY_TEMPLATE = '''#!/usr/bin/env python3
+"""Replay of a qgis-mcp session, exported {stamp}: {count} commands.
+
+Sends each recorded command to the QGIS MCP plugin in order. Layer ids the
+session created are mapped to the ids this replay creates; jobs are waited for.
+Connecting takes over the plugin's client slot from the MCP bridge (it
+reconnects by itself afterwards).
+
+  python {name} [--host 127.0.0.1] [--port {port}] [--keep-going] [--dry-run]
+
+Token: set QGIS_MCP_TOKEN if the plugin requires one. Stdlib only.
+"""
+import argparse, json, os, socket, sys, time
+
+COMMANDS = json.loads({payload})
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default={port})
+    ap.add_argument("--keep-going", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    token = os.environ.get("QGIS_MCP_TOKEN", "")
+    sock = None if a.dry_run else socket.create_connection((a.host, a.port), timeout=900)
+    buf = b""
+
+    def send(ctype, params):
+        nonlocal buf
+        msg = {{"type": ctype, "params": params}}
+        if token:
+            msg["_token"] = token
+        sock.sendall(json.dumps(msg).encode("utf-8") + b"\\n")
+        while b"\\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("QGIS closed the connection")
+            buf += chunk
+        line, buf = buf.split(b"\\n", 1)
+        return json.loads(line)
+
+    ids = {{}}
+    for n, c in enumerate(COMMANDS, 1):
+        text = json.dumps(c["params"])
+        for old, new in ids.items():
+            text = text.replace(old, new)
+        params = json.loads(text)
+        print(f"[{{n}}/{{len(COMMANDS)}}] {{c['type']}}", flush=True)
+        if a.dry_run:
+            continue
+        resp = send(c["type"], params)
+        if resp.get("status") != "success":
+            print("   error:", resp.get("message"), flush=True)
+            if not a.keep_going:
+                sys.exit(1)
+            continue
+        added = [l["id"] for l in resp.get("layers_added") or []]
+        if c["type"] == "start_job":
+            job = resp["result"]["id"]
+            while True:
+                time.sleep(2)
+                st = send("get_job", {{"job_id": job}})["result"]
+                if st["state"] not in ("queued", "running"):
+                    break
+            print("   job", st["state"], flush=True)
+            added = [l["id"] for l in st.get("layers_added") or []]
+        for old, new in zip(c.get("layers_added") or [], added):
+            ids[old] = new
+    print("done", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+@qtool
+def export_session(ctx: Context, path: str, since_seq: int = None,
+                   only_ok: bool = True) -> str:
+    """Write the session journal as a standalone Python script that replays
+    the same commands against a QGIS MCP plugin (layer ids remapped, jobs
+    awaited). Makes an agent session reviewable and repeatable.
+    since_seq: start after that journal entry; only_ok: skip failed calls."""
+    with _JOURNAL_LOCK:
+        entries = [e for e in _JOURNAL
+                   if (since_seq is None or e["seq"] > since_seq) and (e["ok"] or not only_ok)]
+    if not entries:
+        return json.dumps({"error": "nothing to export"})
+    commands = [{"type": e["type"], "params": e["params"],
+                 "layers_added": e.get("layers_added") or []} for e in entries]
+    script = _REPLAY_TEMPLATE.format(
+        stamp=time.strftime("%Y-%m-%d %H:%M"), count=len(commands),
+        name=os.path.basename(path), port=_active_port or QGIS_PORT,
+        payload=repr(json.dumps(commands, ensure_ascii=False)))
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(script)
+    return json.dumps({"path": path, "commands": len(commands),
+                       "first_seq": entries[0]["seq"], "last_seq": entries[-1]["seq"]},
+                      ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2246,7 +2700,7 @@ def _install_middleware():
 
 @qtool
 def set_toolset(ctx: Context, preset: str) -> str:
-    """Reshape the visible toolset in place: full | cartography | data | geoprocess | minimal.
+    """Reshape the visible toolset in place: full | cartography | data | geoprocess | minimal | compact.
 
     Switching emits tools/list_changed, so the client picks up the new surface
     without reconnecting. 'full' restores everything."""

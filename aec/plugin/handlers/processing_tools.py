@@ -1,6 +1,9 @@
 """
-Processing algorithm handlers — list, help, execute algorithms.
+Processing algorithm handlers — list, help, search, execute algorithms.
 """
+
+# search_algorithms' word index over every registered algorithm.
+_ALG_INDEX: dict = {}
 
 
 def register(server):
@@ -108,6 +111,65 @@ def register(server):
             out["valid_parameters"] = sorted(known)
         return out
 
+    def search_algorithms(query: str, limit: int = 10, **_):
+        """Find Processing algorithms by what they do ("points in polygon",
+        "raster to vector", "dissolve by attribute"). Ranks id, name, tags,
+        group, descriptions and parameter names; returns the parameters too so
+        execute_processing can follow without an algorithm_help call."""
+        import re
+        from qgis.core import QgsApplication
+
+        registry = QgsApplication.processingRegistry()
+        algs = registry.algorithms()
+        # The index is rebuilt only when the provider set changes (plugins
+        # adding providers); otherwise every search reuses it.
+        if _ALG_INDEX.get("count") != len(algs):
+            entries = []
+            for alg in algs:
+                try:
+                    params = [p.name() for p in alg.parameterDefinitions()]
+                    entries.append({
+                        "id": alg.id(),
+                        "name": alg.displayName(),
+                        "group": alg.group(),
+                        "summary": alg.shortDescription() or "",
+                        "params": params,
+                        "f": (
+                            (alg.id() + " " + alg.displayName()).lower(),
+                            (" ".join(alg.tags()) + " " + alg.group()).lower(),
+                            (alg.shortDescription() + " " + alg.shortHelpString()[:600]
+                             + " " + " ".join(params)).lower(),
+                        ),
+                    })
+                except Exception:
+                    continue
+            _ALG_INDEX.clear()
+            _ALG_INDEX.update(count=len(algs), entries=entries)
+
+        words = []
+        for w in re.split(r"[^0-9a-zäöüß]+", (query or "").lower()):
+            if len(w) > 3 and w.endswith("s"):
+                w = w[:-1]
+            if len(w) > 1:
+                words.append(w)
+        if not words:
+            raise RuntimeError("query needs at least one word")
+        hits = []
+        for e in _ALG_INDEX["entries"]:
+            score = sum(max((wt for wt, f in zip((3, 2, 1), e["f"]) if w in f), default=0)
+                        for w in words)
+            if score:
+                # Prefer native/qgis algorithms on ties: no external binaries.
+                native = e["id"].startswith(("native:", "qgis:"))
+                hits.append((score, native, e))
+        hits.sort(key=lambda h: (-h[0], not h[1], h[2]["id"]))
+        limit = max(1, min(int(limit or 10), 40))
+        return {
+            "matches": len(hits),
+            "algorithms": [{k: e[k] for k in ("id", "name", "group", "summary", "params")}
+                           for _, _, e in hits[:limit]],
+        }
+
     def list_processing_providers(**_):
         """List available processing providers (native, GDAL, GRASS, etc.)."""
         from qgis.core import QgsApplication
@@ -126,4 +188,5 @@ def register(server):
         "algorithm_help": algorithm_help,
         "execute_processing": execute_processing,
         "list_processing_providers": list_processing_providers,
+        "search_algorithms": search_algorithms,
     })
